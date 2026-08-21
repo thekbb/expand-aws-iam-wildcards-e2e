@@ -1,0 +1,192 @@
+name: End-to-End Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA from expand-aws-iam-wildcards main
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: end-to-end-test-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  reject-non-main:
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require the main branch
+        env:
+          SELECTED_REF: ${{ github.ref }}
+        run: |
+          echo "Run End-to-End Test from main, not ${SELECTED_REF}."
+          exit 1
+
+  pull-request-lifecycle:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Validate source commit format
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a full lowercase commit SHA."
+            exit 1
+          fi
+
+      - name: Check out fixture repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fixture
+          persist-credentials: false
+          ref: main
+
+      - name: Check out action source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          path: action-source
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+          repository: thekbb/expand-aws-iam-wildcards
+
+      - name: Require source commit from main
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        working-directory: action-source
+        run: |
+          resolved_sha="$(git rev-parse HEAD)"
+          if [[ "$resolved_sha" != "$SOURCE_SHA" ]]; then
+            echo "Checked out ${resolved_sha}, expected ${SOURCE_SHA}."
+            exit 1
+          fi
+
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main; then
+            echo "${SOURCE_SHA} does not belong to expand-aws-iam-wildcards main."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.19.0'
+          cache: 'npm'
+          cache-dependency-path: action-source/package-lock.json
+
+      - name: Install source dependencies
+        working-directory: action-source
+        run: npm ci
+
+      - name: Build action source
+        working-directory: action-source
+        run: npm run build
+
+      - name: Create isolated fixture pull request
+        id: fixture
+        env:
+          BODY: >-
+            Temporary pull request for the End-to-End Test workflow. It will be
+            closed and its branch deleted when the run finishes.
+          GH_TOKEN: ${{ github.token }}
+        working-directory: fixture
+        run: |
+          branch="e2e/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fixture_path="fixtures/e2e/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/policy.tf"
+          fixture_directory="${fixture_path%/*}"
+
+          {
+            echo "branch=$branch"
+            echo "fixture_path=$fixture_path"
+          } >> "$GITHUB_OUTPUT"
+
+          git switch -c "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p "$fixture_directory"
+          cat > "$fixture_path" <<'EOF'
+          locals {
+            tagging_actions = [
+              "s3:Get*Tagging",
+            ]
+
+            unrelated_value = true
+
+            object_actions = [
+              "s3:PutObject*",
+            ]
+          }
+          EOF
+          git add -- "$fixture_path"
+          git commit -m "Add end-to-end IAM fixture"
+
+          head_sha="$(git rev-parse HEAD)"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          git push \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${branch}"
+
+          pr_url="$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --draft \
+            --title "E2E fixture for run ${GITHUB_RUN_ID}" \
+            --body "$BODY")"
+          pr_number="${pr_url##*/}"
+          if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Could not parse pull request number from: $pr_url"
+            exit 1
+          fi
+          {
+            echo "pr_number=$pr_number"
+            echo "pr_url=$pr_url"
+          } >> "$GITHUB_OUTPUT"
+          echo "Created fixture pull request: $pr_url"
+          echo "Fixture pull request: [$pr_url]($pr_url)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Exercise the real pull request lifecycle
+        env:
+          E2E_FIXTURE_PATH: ${{ steps.fixture.outputs.fixture_path }}
+          E2E_HEAD_SHA: ${{ steps.fixture.outputs.head_sha }}
+          E2E_PR_NUMBER: ${{ steps.fixture.outputs.pr_number }}
+          E2E_REPOSITORY: ${{ github.repository }}
+          E2E_TOKEN: ${{ github.token }}
+        working-directory: action-source
+        run: npx --no-install tsx scripts/e2e/pull-request.ts
+
+      - name: Close fixture pull request and delete branch
+        if: always() && steps.fixture.outputs.branch != ''
+        env:
+          BRANCH: ${{ steps.fixture.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.fixture.outputs.pr_number }}
+        run: |
+          if [[ -n "$PR_NUMBER" ]]; then
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+              -f state=closed \
+              --silent
+          fi
+
+          if gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" \
+            --silent; then
+            gh api \
+              --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" \
+              --silent
+          fi
