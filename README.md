@@ -20,8 +20,9 @@ creates a unique draft fixture pull request here.
 
 The lifecycle test verifies comment creation, an unchanged rerun, in-place
 updates, stale-comment deletion, and preservation of a thread with a real review
-reply. Its final step closes the fixture pull request and deletes its branch,
-even when an earlier test phase fails.
+reply. It also follows a representative AWS documentation link and requires the
+expected native action anchor. Its final step closes the fixture pull request
+and deletes its branch, even when an earlier test phase fails.
 
 ## Security Boundary
 
